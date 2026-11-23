@@ -56,15 +56,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.VolumeDown
-import androidx.compose.material.icons.automirrored.rounded.VolumeUp
-import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material3.CircularProgressIndicator
 import com.opentune.ui.theme.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import com.opentune.ui.theme.Text
@@ -79,13 +74,12 @@ import androidx.compose.animation.animateColorAsState
 import com.opentune.ui.theme.rememberArtworkSeed
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.Path
 import androidx.compose.foundation.shape.RoundedCornerShape
 import com.opentune.ui.components.glass
 import androidx.compose.runtime.snapshotFlow
 import com.opentune.ui.components.pressable
-import androidx.compose.material.icons.rounded.FastRewind
-import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
@@ -151,6 +145,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import coil3.request.allowHardware
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.vectorResource
+import com.opentune.ui.theme.AppIcons
+import com.opentune.ui.components.posterSmoke
 
 /**
  * The full player's backdrop, in the style chosen in settings. With
@@ -186,21 +184,24 @@ fun PlayerBackdrop(
     artworkMotion: com.opentune.ui.components.ArtworkMotion? = null,
     /** Apple's animated cover for the playing song, looped over the full-screen still. */
     video: com.opentune.data.covers.AppleMotionArt.Motion? = null,
+    /** The song's music video is showing in the full cover's place. */
+    musicVideo: Boolean = false,
+    /** The playback player's video picture, drawn in the full cover's place while [musicVideo]. */
+    videoSurface: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit = {},
 ) {
     val scheme = MaterialTheme.colorScheme
     val ui by com.opentune.data.settings.AppSettings.ui.collectAsState()
-    val seed = rememberArtworkSeed(artworkUrl)
+    val seed = rememberArtworkSeed(artworkUrl, keepLast = true)
     // With the setting on, the full-screen cover's own colour is the backdrop:
     // the cover fades into itself and the player reads as one surface.
     val matched = if (ui.coverColorBackground && fullCover) seed else null
-    if (style == PlayerBackground.AMOLED) {
-        Box(modifier.background(Color.Black))
-        return
-    }
+    // Pure black: no colours, no Canvas and no full cover, but a music video still
+    // shows in the cover's place (it did before the video took that place).
+    val amoled = style == PlayerBackground.AMOLED
     // The cover's own colours, not the scheme's turned ones, so each background looks like the cover.
     val tones = rememberCoverTones(artworkUrl)
-    Box(modifier.background(matched ?: tones.base)) {
-        if (matched == null) {
+    Box(modifier.background(if (amoled) Color.Black else matched ?: tones.base)) {
+        if (matched == null && !amoled) {
             when (style) {
                 PlayerBackground.AMOLED -> Unit
                 PlayerBackground.ECHO_GLOW -> EchoGlowBackground(animate && playing, Modifier.matchParentSize(), tones.lights, tones.base)
@@ -245,9 +246,37 @@ fun PlayerBackdrop(
                 }
             }
         }
-        if (canvas != null) {
+        if (canvas != null && !amoled) {
             CanvasBackdrop(canvas, canvasPlaying, titleTop, canvasBehindText, Modifier.matchParentSize())
-        } else if (fullCover) {
+        } else if (fullCover && musicVideo) {
+            // The music video in the full cover's place: the same span from the top
+            // and the same top shade. Its bottom dissolves the way the cover's
+            // does — the picture's own alpha fades out, anchored to where a 16:9
+            // picture's bottom falls in this span. A colour scrim here instead
+            // painted the backdrop's near-black base over the empty stretch
+            // under the picture, which read as a black band.
+            androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth().graphicsLayer { alpha = if (fullCoverVisible) 1f else 0f }) {
+                val height = maxOf(maxWidth / 0.9f, (fullCoverBottom ?: 0.dp) + FULL_COVER_OVERLAP)
+                val pictureBottom = height / 2 + (maxWidth / (16f / 9f)) / 2
+                val fadeStart = ((pictureBottom - FULL_COVER_FADE * 0.6f) / height).coerceIn(0f, 1f)
+                val fadeEnd = ((pictureBottom + FULL_COVER_FADE * 0.4f) / height).coerceIn(0f, 1f)
+                Box(Modifier.fillMaxWidth().height(height)) {
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                            .drawWithContent {
+                                drawContent()
+                                drawRect(
+                                    Brush.verticalGradient(fadeStart to Color.Black, fadeEnd to Color.Transparent),
+                                    blendMode = BlendMode.DstIn,
+                                )
+                            },
+                    ) { videoSurface() }
+                    Box(Modifier.matchParentSize().background(Brush.verticalGradient(0f to Color.Black.copy(alpha = com.opentune.ui.components.FULL_COVER_TOP_SHADE), 0.2f to Color.Transparent)))
+                }
+            }
+        } else if (fullCover && !amoled) {
             CoverSwap(CoverShown(artworkUrl, index, songId), change) { url, motion ->
                 // The cover runs from the top down to just behind the title and
                 // fades out there into whatever backdrop is below it, with a light
@@ -572,7 +601,7 @@ private val FULL_COVER_FADE = 210.dp
 @Composable
 private fun MeshGradient(artworkUrl: String?, animate: Boolean, modifier: Modifier = Modifier) {
     val scheme = MaterialTheme.colorScheme
-    val palette = com.opentune.ui.theme.rememberArtworkPalette(artworkUrl)
+    val palette = com.opentune.ui.theme.rememberArtworkPalette(artworkUrl, keepLast = true)
     // The cover's colours, or the song's scheme until they've been read. Each
     // is kept between dark and mid so none of them glares behind white text.
     val wanted = remember(palette, scheme.primary, scheme.tertiary) {
@@ -804,6 +833,10 @@ fun ArtworkPane(
     canvasShowing: Boolean = false,
     /** How round the cover's corners are. */
     corner: androidx.compose.ui.unit.Dp = 28.dp,
+    /** The song's music video is showing in the cover's place. */
+    musicVideo: Boolean = false,
+    /** The playback player's video picture, drawn over the cover while [musicVideo]. */
+    videoSurface: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit = {},
 ) {
     val coverShown by animateFloatAsState(if (canvasShowing) 0f else 1f, tween(450), label = "coverOverCanvas")
     val scale by animateFloatAsState(
@@ -870,8 +903,12 @@ fun ArtworkPane(
                     shape = androidx.compose.foundation.shape.RoundedCornerShape(corner),
                     imageModifier = Modifier.livingArt(isPlaying, moving, artworkMotion),
                 ) {
+                    // The music video takes the cover's place while video mode is on.
+                    if (musicVideo && url == song.thumbnailUrl) {
+                        videoSurface()
+                    }
                     // Only on the playing song's cover, not on one leaving as the song changes.
-                    if (video != null && !canvasShowing && url == song.thumbnailUrl) {
+                    else if (video != null && !canvasShowing && url == song.thumbnailUrl) {
                         val quality = com.opentune.data.settings.AppSettings.ui.collectAsState().value.motionQuality
                         // Keyed on the quality, so a new choice in Settings takes effect at once.
                         androidx.compose.runtime.key(quality) {
@@ -1010,11 +1047,11 @@ fun SeekBar(
     marks: List<Long> = emptyList(),
     quality: (@Composable () -> Unit)? = null,
 ) {
-    var dragFraction by remember { mutableStateOf<Float?>(null) }
+    var dragFraction by remember(durationMs) { mutableStateOf<Float?>(null) }
     // Where the finger let go (or tapped), held until the player has got there: the seek takes
     // a few frames, and drawn from the player's position at once the line went back to where
     // it was and then jumped to the new place.
-    var heldFraction by remember { mutableStateOf<Float?>(null) }
+    var heldFraction by remember(durationMs) { mutableStateOf<Float?>(null) }
     LaunchedEffect(heldFraction, durationMs) {
         val held = heldFraction ?: return@LaunchedEffect
         if (durationMs <= 0) { heldFraction = null; return@LaunchedEffect }
@@ -1059,7 +1096,7 @@ fun SeekBar(
 
     val seekHaptics = com.opentune.ui.components.rememberHaptics()
     fun fraction(): Float = dragFraction ?: heldFraction
-        ?: if (durationMs > 0) (position().toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+    ?: if (durationMs > 0) (position().toFloat() / durationMs).coerceIn(0f, 1f) else 0f
     // Until the song's length is known there's nothing to seek: a band of light runs along the
     // track instead, so it reads as loading rather than stuck at the start.
     val loading = durationMs <= 0
@@ -1134,7 +1171,7 @@ fun SeekBar(
                 val b = if (durationMs > 0) (buffered().toFloat() / durationMs).coerceIn(0f, 1f) else 0f
                 // Under the wave, the straight track starts where the played part ends: drawn the
                 // whole way along, it showed as a flat line behind the wave.
-                val trackFrom = if (amplitude > 0f && sweep == null) (size.width * f + h * 1.5f * amplitude).coerceAtMost(size.width) else 0f
+                val trackFrom = if (amplitude > 0f && sweep == null) (size.width * f + h * 0.5f * amplitude).coerceAtMost(size.width) else 0f
                 if (trackFrom < size.width) drawRoundRect(inactive, Offset(trackFrom, y), Size(size.width - trackFrom, h), r)
                 if (sweep != null) {
                     val at = sweep.value * size.width
@@ -1148,19 +1185,30 @@ fun SeekBar(
                 val bufferedTo = size.width * maxOf(b, f)
                 if (bufferedTo > trackFrom) drawRoundRect(bufferedColor, Offset(trackFrom, y), Size(bufferedTo - trackFrom, h), r)
                 if (amplitude > 0f) {
-                    // Played part as a sine wave, a stroke as thick as the track.
+                    // Played part as a sine wave, a stroke as thick as the track. The path
+                    // starts and ends on the curve itself: it used to start from the centre
+                    // line, and that first vertical step read as a glitch at the left end.
+                    // A point per pixel keeps the curve smooth instead of faceted, and the
+                    // joins are rounded so the stroke can't kink at the bends. The wave's
+                    // length is a fixed gentle one rather than a multiple of the track's
+                    // thickness, which packed a dozen busy waves across the bar.
                     val amp = h * 0.9f * amplitude
-                    val length = h * 7f
+                    val length = 45.dp.toPx()
+                    val phase = phaseState?.value ?: 0f
+                    val mid = size.height / 2
+                    val endX = size.width * f
+                    fun waveY(x: Float) = mid + amp * sin(x / length * 2 * PI.toFloat() + phase)
                     val wavePath = Path().apply {
-                        moveTo(0f, size.height / 2)
-                        var x = 0f
-                        while (x <= size.width * f) {
-                            lineTo(x, size.height / 2 + amp * sin(x / length * 2 * PI.toFloat() + (phaseState?.value ?: 0f)))
-                            x += 2f
+                        moveTo(0f, waveY(0f))
+                        var x = 1f
+                        while (x < endX) {
+                            lineTo(x, waveY(x))
+                            x += 1f
                         }
+                        if (endX > 0f) lineTo(endX, waveY(endX))
                     }
-                    if (gradient) drawPath(wavePath, Brush.horizontalGradient(listOf(active, gradientEnd), endX = maxOf(size.width * f, 1f)), style = Stroke(width = h, cap = StrokeCap.Round))
-                    else drawPath(wavePath, active, style = Stroke(width = h, cap = StrokeCap.Round))
+                    if (gradient) drawPath(wavePath, Brush.horizontalGradient(listOf(active, gradientEnd), endX = maxOf(size.width * f, 1f)), style = Stroke(width = h, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    else drawPath(wavePath, active, style = Stroke(width = h, cap = StrokeCap.Round, join = StrokeJoin.Round))
                 } else if (lineThumb && thumbRadius > 0.dp) {
                     // Clip the full capsule at the handle instead of rounding the
                     // played segment there. Its outer edge stays round; the join
@@ -1316,7 +1364,7 @@ fun MiniPlayer(
     val accent = MaterialTheme.colorScheme.primary
     val track = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f)
     // The cover's own colour, faded into the glass, so each song tints the card.
-    val seed = rememberArtworkSeed(song.thumbnailUrl)
+    val seed = rememberArtworkSeed(song.thumbnailUrl, keepLast = true)
     val colourFromCover = com.opentune.data.settings.AppSettings.ui.collectAsState().value.miniPlayerTint
     val tint by animateColorAsState(((if (colourFromCover) seed else null) ?: MaterialTheme.colorScheme.surfaceContainerHigh).copy(alpha = 0.38f), tween(600), label = "miniTint")
 
@@ -1343,9 +1391,14 @@ fun MiniPlayer(
         return
     }
 
-    val shape = RoundedCornerShape(22.dp)
+    // The Poster layout's card: rounder, in smoked glass, its cover and words larger.
+    val poster = com.opentune.ui.components.posterLayout()
+    val shape = RoundedCornerShape(if (poster) 30.dp else 22.dp)
     if (replica) {
-        Box(modifier.background(replicaFace)) { MiniRow(song, isPlaying, isBuffering, hasNext, progress, accent, track, {}, {}, landing) }
+        // No buttons that take a touch: the replica lies over the open player, at its full size and
+        // invisible once the card is up, and its play and next buttons, centred on the screen,
+        // used to swallow taps meant for the player under them (its "…" and heart among them).
+        Box(modifier.background(replicaFace).clearAndSetSemantics { }) { MiniRow(song, isPlaying, isBuffering, hasNext, progress, accent, track, null, null, landing) }
         return
     }
     Surface(
@@ -1359,8 +1412,9 @@ fun MiniPlayer(
                 translationY = offsetY.value
                 alpha = 1f - (offsetY.value / (dismissThreshold * 2.2f)).coerceIn(0f, 0.8f)
             }
-            .glass(shape, tint, swell = false)
-            .pullToOpen(round = false, onOpen = onClick)
+            .then(if (poster) Modifier.posterSmoke(shape) else Modifier.glass(shape, tint, swell = false))
+            // The Poster card's cover is round, so the flight to the player starts from a circle.
+            .pullToOpen(round = poster, onOpen = onClick)
             .pointerInput(Unit) {
                 detectHorizontalDragGestures(
                     onDragEnd = {
@@ -1433,7 +1487,7 @@ fun MiniPlayer(
                 }
             },
     ) {
-        MiniRow(song, isPlaying, isBuffering, hasNext, progress, accent, track, onTogglePlay, onNext, landing)
+        MiniRow(song, isPlaying, isBuffering, hasNext, progress, accent, track, onTogglePlay, onNext, landing, poster)
     }
 }
 
@@ -1441,8 +1495,44 @@ fun MiniPlayer(
 @Composable
 private fun MiniRow(
     song: Song, isPlaying: Boolean, isBuffering: Boolean, hasNext: Boolean, progress: () -> Float,
-    accent: Color, track: Color, onTogglePlay: () -> Unit, onNext: () -> Unit, landing: Modifier,
+    accent: Color, track: Color, onTogglePlay: (() -> Unit)?, onNext: (() -> Unit)?, landing: Modifier,
+    poster: Boolean = false,
 ) {
+    if (poster) {
+        // On smoked glass, drawn light: a larger cover, the title over the artist, then play
+        // and next as plain glyphs, as the Poster layout's reference has them.
+        val ink = com.opentune.ui.components.PosterInk
+        // The cover is round, folded by a scroll or not; folding only moves it over.
+        val fold = com.opentune.ui.components.LocalPosterFold.current
+        androidx.compose.runtime.CompositionLocalProvider(androidx.compose.material3.LocalContentColor provides ink.on) {
+            Row(Modifier.fillMaxSize().padding(start = 8.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                AnimatedContent(song, transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) }, label = "mini",
+                    // Folded, the card is as tall as the round cover plus 3 dp each side: the cover moves
+                    // left to the same 3 dp, so it sits evenly in the card's round end.
+                    modifier = Modifier.weight(1f).graphicsLayer { translationX = -5.dp.toPx() * fold().coerceIn(0f, 1f) }) { s ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Artwork(
+                            s.thumbnailUrl.artworkAt(ROW_ART_PX),
+                            Modifier.size(50.dp).then(landing).clip(CircleShape),
+                            CircleShape,
+                        )
+                        Column(Modifier.padding(start = 14.dp)) {
+                            Text(s.title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = ink.on)
+                            Text(s.artist, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium, color = ink.off)
+                        }
+                    }
+                }
+                Box(Modifier.size(48.dp).clip(CircleShape).then(if (onTogglePlay != null) Modifier.clickable(onClick = onTogglePlay) else Modifier), contentAlignment = Alignment.Center) {
+                    if (isBuffering) CircularProgressIndicator(Modifier.matchParentSize().padding(4.dp), strokeWidth = 2.dp, color = ink.on)
+                    Icon(if (isPlaying) ImageVector.vectorResource(AppIcons.Pause) else ImageVector.vectorResource(AppIcons.PlayArrow), if (isPlaying) "Pause" else "Play", Modifier.size(32.dp), tint = ink.on)
+                }
+                MiniNext(onNext, hasNext) {
+                    Icon(ImageVector.vectorResource(AppIcons.SkipNext), "Next", Modifier.size(32.dp), tint = if (hasNext) ink.on else ink.off)
+                }
+            }
+        }
+        return
+    }
     Row(Modifier.fillMaxSize().padding(start = 10.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         AnimatedContent(song, transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) }, label = "mini", modifier = Modifier.weight(1f)) { s ->
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1454,14 +1544,26 @@ private fun MiniRow(
             }
         }
         // Play inside the progress ring.
-        Box(Modifier.size(46.dp).clip(CircleShape).clickable(onClick = onTogglePlay), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(46.dp).clip(CircleShape).then(if (onTogglePlay != null) Modifier.clickable(onClick = onTogglePlay) else Modifier), contentAlignment = Alignment.Center) {
             ProgressRing(progress, accent, track, stroke = 2.5.dp, modifier = Modifier.matchParentSize().padding(3.dp))
             if (isBuffering) CircularProgressIndicator(Modifier.matchParentSize().padding(3.dp), strokeWidth = 2.5.dp, color = accent)
-            Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, if (isPlaying) "Pause" else "Play", Modifier.size(24.dp))
+            Icon(if (isPlaying) ImageVector.vectorResource(AppIcons.Pause) else ImageVector.vectorResource(AppIcons.PlayArrow), if (isPlaying) "Pause" else "Play", Modifier.size(24.dp))
         }
-        IconButton(onClick = onNext, enabled = hasNext) {
-            Icon(Icons.Rounded.SkipNext, "Next", Modifier.size(26.dp))
+        MiniNext(onNext, hasNext) {
+            Icon(ImageVector.vectorResource(AppIcons.SkipNext), "Next", Modifier.size(26.dp))
         }
+    }
+}
+
+/** The mini player's next button; without [onNext] (the sheet's replica) only its look, taking no touches. */
+@Composable
+private fun MiniNext(onNext: (() -> Unit)?, hasNext: Boolean, icon: @Composable () -> Unit) {
+    if (onNext != null) IconButton(onClick = onNext, enabled = hasNext, content = icon)
+    else Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+        androidx.compose.runtime.CompositionLocalProvider(
+            androidx.compose.material3.LocalContentColor provides androidx.compose.material3.LocalContentColor.current.copy(alpha = if (hasNext) 1f else 0.38f),
+            content = icon,
+        )
     }
 }
 
@@ -1667,7 +1769,7 @@ internal fun OutputVolumeBar(receiver: com.opentune.cast.Receiver?, modifier: Mo
     val focusInk = MaterialTheme.colorScheme.primary
     val step = if (receiver != null) 0.05f else 1f / max
     Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Icon(Icons.AutoMirrored.Rounded.VolumeDown, "Volume down", tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        Icon(ImageVector.vectorResource(AppIcons.VolumeDown), "Volume down", tint = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.size(20.dp).clickable { adjust(-step) })
         val track = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f)
         val fill = MaterialTheme.colorScheme.onSurface
@@ -1716,7 +1818,7 @@ internal fun OutputVolumeBar(receiver: com.opentune.cast.Receiver?, modifier: Mo
             if (focused) drawRoundRect(focusInk, Offset(0f, y - 3.dp.toPx()), Size(size.width, h + 6.dp.toPx()), CornerRadius(h), style = Stroke(2.dp.toPx()))
             drawRoundRect(fill, Offset(0f, y), Size(size.width * f, h), CornerRadius(h / 2))
         }
-        Icon(Icons.AutoMirrored.Rounded.VolumeUp, "Volume up", tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        Icon(ImageVector.vectorResource(AppIcons.VolumeUp), "Volume up", tint = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.size(20.dp).clickable { adjust(step) })
     }
 }
@@ -1762,6 +1864,10 @@ fun VinylPane(
     onSwipePrevious: () -> Unit,
     animate: Boolean,
     modifier: Modifier = Modifier,
+    /** The song's music video is showing in the record's place. */
+    musicVideo: Boolean = false,
+    /** The playback player's video picture, drawn while [musicVideo]. */
+    videoSurface: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit = {},
 ) {
     var angle by remember { mutableFloatStateOf(0f) }
     LaunchedEffect(isPlaying, animate) {
@@ -1776,7 +1882,17 @@ fun VinylPane(
     }
     val groove = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f)
     ArtworkSwipeArea(onSwipeNext = onSwipeNext, onSwipePrevious = onSwipePrevious, modifier = modifier.fillMaxWidth()) {
-        Box(
+        if (musicVideo) {
+            // The record rests and the video takes its place, unturned: a turning
+            // picture would fight the frame's own fitting.
+            Box(
+                Modifier
+                    .fillMaxWidth(0.92f)
+                    .aspectRatio(16f / 9f)
+                    .align(Alignment.Center)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(20.dp))
+            ) { videoSurface() }
+        } else Box(
             Modifier
                 .fillMaxWidth(0.92f)
                 .aspectRatio(1f)
